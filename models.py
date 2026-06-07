@@ -34,8 +34,12 @@ CREATE TABLE IF NOT EXISTS integration_settings (
     shopify_refresh_token TEXT,
     shopify_refresh_token_expires_at TEXT,
     meta_page_id TEXT,
+    meta_page_name TEXT,
     meta_access_token TEXT,
+    meta_user_access_token TEXT,
+    meta_user_token_expires_at TEXT,
     instagram_business_account_id TEXT,
+    instagram_username TEXT,
     webhook_verify_token TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

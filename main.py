@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -33,13 +34,30 @@ from database import (
     has_value,
     init_db,
     save_meta_connection,
+    save_meta_oauth_authorization,
     save_password_reset_token,
     save_shopify_connection,
     to_iso,
     update_user_password,
 )
 from services.email_service import build_password_reset_link, send_password_reset_email
-from services.meta_service import handle_webhook_placeholder, verify_webhook
+from services.meta_service import (
+    MetaOAuthError,
+    build_authorization_url as build_meta_authorization_url,
+    create_webhook_verify_token,
+    decode_oauth_state as decode_meta_oauth_state,
+    exchange_code_for_user_token as exchange_meta_code_for_user_token,
+    fetch_pages as fetch_meta_pages,
+    subscribe_app_page_webhooks,
+    subscribe_page_webhooks,
+    verify_webhook_signature,
+    verify_webhook,
+)
+from services.messaging_service import (
+    flush_pending_messages_now,
+    get_recent_meta_webhook_results,
+    handle_meta_message_webhook,
+)
 from schemas import (
     AuthOut,
     ForgotPasswordIn,
@@ -47,7 +65,10 @@ from schemas import (
     MessageOut,
     MetaConnectionIn,
     MetaConnectionOut,
+    MetaPageSelectIn,
+    MetaPagesOut,
     OnboardingStatusOut,
+    OAuthStartOut,
     ResetPasswordIn,
     ShopifyConnectionOut,
     ShopifyOAuthStartIn,
@@ -79,6 +100,13 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    # Reply to any buyer messages still waiting in the debounce buffer so they
+    # are not dropped when the server stops.
+    await flush_pending_messages_now()
 
 
 @app.get("/health")
@@ -259,12 +287,146 @@ def upsert_meta_connection(
     return _meta_response(row)
 
 
+@app.post("/api/integrations/meta/oauth/start", response_model=OAuthStartOut)
+def start_meta_oauth(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    try:
+        authorization_url = build_meta_authorization_url(user_id=current_user["id"])
+    except MetaOAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"authorization_url": authorization_url}
+
+
+@app.get("/api/integrations/meta/oauth/callback")
+async def complete_meta_oauth(request: Request) -> RedirectResponse:
+    query = request.query_params
+    code = query.get("code", "")
+    state = query.get("state", "")
+    error = query.get("error_message") or query.get("error_description") or query.get("error")
+
+    try:
+        if error:
+            raise MetaOAuthError(error)
+        if not code:
+            raise MetaOAuthError("Meta did not return an authorization code")
+
+        state_payload = decode_meta_oauth_state(state)
+        token_response = await exchange_meta_code_for_user_token(code)
+        save_meta_oauth_authorization(
+            user_id=int(state_payload["user_id"]),
+            user_access_token=token_response["access_token"],
+            token_expires_in=token_response.get("expires_in"),
+            webhook_verify_token=create_webhook_verify_token(),
+        )
+    except (KeyError, TypeError, ValueError, MetaOAuthError) as exc:
+        return RedirectResponse(_frontend_redirect({"meta_error": str(exc)}))
+
+    return RedirectResponse(_frontend_redirect({"meta": "authorized"}))
+
+
 @app.get("/api/integrations/meta", response_model=MetaConnectionOut)
 def read_meta_connection(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     row = get_integration_settings(current_user["id"])
     return _meta_response(row)
+
+
+@app.get("/api/integrations/meta/webhook/recent")
+def read_recent_meta_webhook_results(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return {"events": get_recent_meta_webhook_results()}
+
+
+@app.get("/api/integrations/meta/pages", response_model=MetaPagesOut)
+async def list_meta_pages(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    row = get_integration_settings(current_user["id"])
+    user_access_token = row.get("meta_user_access_token") if row else None
+    if not user_access_token:
+        raise HTTPException(status_code=400, detail="Connect Meta before selecting a Page")
+
+    try:
+        pages = await fetch_meta_pages(user_access_token)
+    except MetaOAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "pages": [
+            {
+                "id": page["id"],
+                "name": page["name"],
+                "instagram_business_account_id": (
+                    page["instagram_business_account"]["id"]
+                    if page.get("instagram_business_account")
+                    else None
+                ),
+                "instagram_username": (
+                    page["instagram_business_account"]["username"]
+                    if page.get("instagram_business_account")
+                    else None
+                ),
+            }
+            for page in pages
+        ]
+    }
+
+
+@app.post("/api/integrations/meta/pages/select", response_model=MetaConnectionOut)
+async def select_meta_page(
+    payload: MetaPageSelectIn,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    row = get_integration_settings(current_user["id"])
+    user_access_token = row.get("meta_user_access_token") if row else None
+    if not user_access_token:
+        raise HTTPException(status_code=400, detail="Connect Meta before selecting a Page")
+
+    try:
+        pages = await fetch_meta_pages(user_access_token)
+    except MetaOAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    selected_page = next(
+        (page for page in pages if page["id"] == payload.page_id.strip()),
+        None,
+    )
+    if not selected_page:
+        raise HTTPException(status_code=404, detail="Selected Page was not found")
+    if not selected_page.get("access_token"):
+        raise HTTPException(status_code=400, detail="Meta did not return a Page access token")
+
+    instagram = selected_page.get("instagram_business_account")
+    verify_token = (
+        row.get("webhook_verify_token")
+        if row and has_value(row.get("webhook_verify_token"))
+        else create_webhook_verify_token()
+    )
+
+    try:
+        await subscribe_app_page_webhooks(
+            callback_url=f"{settings.backend_url.rstrip('/')}/meta/webhook",
+            verify_token=verify_token,
+        )
+        await subscribe_page_webhooks(selected_page["id"], selected_page["access_token"])
+    except MetaOAuthError:
+        # The Page can still be saved; the app dashboard/webhook setup may not be ready yet.
+        pass
+
+    saved_row = save_meta_connection(
+        user_id=current_user["id"],
+        page_id=selected_page["id"],
+        page_name=selected_page["name"],
+        access_token=selected_page["access_token"],
+        instagram_business_account_id=instagram["id"] if instagram else None,
+        instagram_username=instagram["username"] if instagram else None,
+        webhook_verify_token=verify_token,
+    )
+    return _meta_response(saved_row)
 
 
 @app.get("/meta/webhook")
@@ -287,9 +449,18 @@ def verify_meta_webhook(
 
 
 @app.post("/meta/webhook")
-async def receive_meta_webhook(request: Request) -> dict[str, str]:
-    payload = await request.json()
-    return await handle_webhook_placeholder(payload)
+async def receive_meta_webhook(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    signature = request.headers.get("x-hub-signature-256")
+    if not verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=403, detail="Webhook signature verification failed")
+
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid webhook payload") from exc
+
+    return await handle_meta_message_webhook(payload)
 
 
 def _auth_response(user: dict[str, Any]) -> dict[str, Any]:
@@ -328,15 +499,27 @@ def _shopify_response(row: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 def _meta_response(row: Optional[dict[str, Any]]) -> dict[str, Any]:
     page_id = row.get("meta_page_id") if row else None
+    page_name = row.get("meta_page_name") if row else None
     access_token = row.get("meta_access_token") if row else None
+    instagram_business_account_id = (
+        row.get("instagram_business_account_id") if row else None
+    )
+    instagram_username = row.get("instagram_username") if row else None
+    oauth_authorized = bool(row and has_value(row.get("meta_user_access_token")))
+    facebook_connected = has_value(page_id) and has_value(access_token)
+    instagram_connected = facebook_connected and has_value(instagram_business_account_id)
     return {
-        "connected": has_value(page_id),
+        "connected": facebook_connected,
+        "oauth_authorized": oauth_authorized,
+        "facebook_connected": facebook_connected,
+        "instagram_connected": instagram_connected,
         "page_id": page_id,
+        "page_name": page_name,
         "access_token_last4": _secret_last4(access_token),
-        "instagram_business_account_id": (
-            row.get("instagram_business_account_id") if row else None
-        ),
+        "instagram_business_account_id": instagram_business_account_id,
+        "instagram_username": instagram_username,
         "webhook_verify_token": row.get("webhook_verify_token") if row else None,
+        "webhook_callback_url": f"{settings.backend_url.rstrip('/')}/meta/webhook",
         "created_at": to_iso(row.get("created_at")) if row else None,
         "updated_at": to_iso(row.get("updated_at")) if row else None,
     }

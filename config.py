@@ -48,6 +48,7 @@ class Settings:
     smtp_from_email: str = os.getenv("SMTP_FROM_EMAIL", "no-reply@bingasys.local")
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    gemini_vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
     gemini_api_base_url: str = os.getenv(
         "GEMINI_API_BASE_URL",
         "https://generativelanguage.googleapis.com/v1beta",
@@ -67,6 +68,31 @@ class Settings:
     )
     shopify_oauth_state_expire_minutes: int = int(
         os.getenv("SHOPIFY_OAUTH_STATE_EXPIRE_MINUTES", "10")
+    )
+    shopify_api_version: str = os.getenv("SHOPIFY_API_VERSION", "2025-10")
+    shopify_product_cache_ttl_seconds: int = int(
+        os.getenv("SHOPIFY_PRODUCT_CACHE_TTL_SECONDS", "900")
+    )
+    shopify_image_match_catalog_limit: int = int(
+        os.getenv("SHOPIFY_IMAGE_MATCH_CATALOG_LIMIT", "120")
+    )
+    meta_app_id: str = os.getenv("META_APP_ID", "")
+    meta_app_secret: str = os.getenv("META_APP_SECRET", "")
+    meta_graph_api_version: str = os.getenv("META_GRAPH_API_VERSION", "v21.0")
+    meta_scopes: str = os.getenv(
+        "META_SCOPES",
+        "pages_show_list,pages_messaging,pages_manage_metadata,business_management",
+    )
+    meta_redirect_uri: str = os.getenv(
+        "META_REDIRECT_URI",
+        f"{os.getenv('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/')}"
+        "/api/integrations/meta/oauth/callback",
+    )
+    meta_oauth_state_expire_minutes: int = int(
+        os.getenv("META_OAUTH_STATE_EXPIRE_MINUTES", "10")
+    )
+    meta_message_debounce_seconds: float = float(
+        os.getenv("META_MESSAGE_DEBOUNCE_SECONDS", "2.5")
     )
 
 

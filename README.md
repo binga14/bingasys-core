@@ -1,13 +1,14 @@
 # Bingasys Core
 
-FastAPI backend for Bingasys auth, onboarding, Shopify OAuth, Meta integration settings, and webhooks.
+FastAPI backend for Bingasys auth, onboarding, Shopify OAuth, Meta OAuth, integration settings, and webhooks.
 
 ## Prerequisites
 
 - Python 3.9+
 - Docker Desktop or another Docker runtime
-- ngrok for local Shopify OAuth testing
+- ngrok for local Shopify and Meta OAuth testing
 - A Shopify app in the Shopify Dev Dashboard
+- A Meta app in Meta for Developers
 
 ## Run Locally
 
@@ -31,6 +32,8 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/bingasys
 SHOPIFY_CLIENT_ID=
 SHOPIFY_CLIENT_SECRET=
 SHOPIFY_SCOPES=read_products,read_orders,write_orders,read_inventory,write_inventory,read_locations
+META_APP_ID=
+META_APP_SECRET=
 ```
 
 Create a virtual environment and start the API:
@@ -98,6 +101,18 @@ read_locations
 ```
 
 After changing scopes, release the Shopify app version and reconnect/reinstall the app on the test store.
+
+## Meta OAuth Locally
+
+Expose the backend with ngrok, then update `.env`:
+
+```env
+BACKEND_URL=https://your-ngrok-domain.ngrok-free.dev
+META_REDIRECT_URI=https://your-ngrok-domain.ngrok-free.dev/api/integrations/meta/oauth/callback
+FRONTEND_URL=http://localhost:5173
+```
+
+In Meta for Developers, configure the OAuth redirect URL to match `META_REDIRECT_URI`.
 
 ## Useful Checks
 

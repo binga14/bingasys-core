@@ -48,6 +48,10 @@ class ShopifyOAuthStartOut(BaseModel):
     authorization_url: str
 
 
+class OAuthStartOut(BaseModel):
+    authorization_url: str
+
+
 class ShopifyConnectionOut(BaseModel):
     connected: bool = False
     store_domain: Optional[str] = None
@@ -65,12 +69,33 @@ class MetaConnectionIn(BaseModel):
 
 class MetaConnectionOut(BaseModel):
     connected: bool = False
+    oauth_authorized: bool = False
+    facebook_connected: bool = False
+    instagram_connected: bool = False
     page_id: Optional[str] = None
+    page_name: Optional[str] = None
     access_token_last4: Optional[str] = None
     instagram_business_account_id: Optional[str] = None
+    instagram_username: Optional[str] = None
     webhook_verify_token: Optional[str] = None
+    webhook_callback_url: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class MetaPageOut(BaseModel):
+    id: str
+    name: str
+    instagram_business_account_id: Optional[str] = None
+    instagram_username: Optional[str] = None
+
+
+class MetaPagesOut(BaseModel):
+    pages: list[MetaPageOut]
+
+
+class MetaPageSelectIn(BaseModel):
+    page_id: str
 
 
 class OnboardingStatusOut(BaseModel):

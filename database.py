@@ -30,7 +30,11 @@ def init_db() -> None:
                 ALTER TABLE integration_settings
                 ADD COLUMN IF NOT EXISTS shopify_access_token_expires_at TEXT,
                 ADD COLUMN IF NOT EXISTS shopify_refresh_token TEXT,
-                ADD COLUMN IF NOT EXISTS shopify_refresh_token_expires_at TEXT
+                ADD COLUMN IF NOT EXISTS shopify_refresh_token_expires_at TEXT,
+                ADD COLUMN IF NOT EXISTS meta_page_name TEXT,
+                ADD COLUMN IF NOT EXISTS meta_user_access_token TEXT,
+                ADD COLUMN IF NOT EXISTS meta_user_token_expires_at TEXT,
+                ADD COLUMN IF NOT EXISTS instagram_username TEXT
                 """
             )
 
@@ -167,6 +171,21 @@ def find_integration_by_webhook_verify_token(
     return dict(row) if row else None
 
 
+def find_integration_by_meta_page_id(page_id: str) -> Optional[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_settings
+                WHERE meta_page_id = %s
+                """,
+                (page_id,),
+            )
+            row = cursor.fetchone()
+    return dict(row) if row else None
+
+
 def save_shopify_connection(
     user_id: int,
     store_domain: str,
@@ -220,6 +239,8 @@ def save_meta_connection(
     access_token: str,
     webhook_verify_token: str,
     instagram_business_account_id: Optional[str] = None,
+    page_name: Optional[str] = None,
+    instagram_username: Optional[str] = None,
 ) -> dict[str, Any]:
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -228,17 +249,21 @@ def save_meta_connection(
                 INSERT INTO integration_settings (
                     user_id,
                     meta_page_id,
+                    meta_page_name,
                     meta_access_token,
                     instagram_business_account_id,
+                    instagram_username,
                     webhook_verify_token,
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     meta_page_id = EXCLUDED.meta_page_id,
+                    meta_page_name = EXCLUDED.meta_page_name,
                     meta_access_token = EXCLUDED.meta_access_token,
                     instagram_business_account_id = EXCLUDED.instagram_business_account_id,
+                    instagram_username = EXCLUDED.instagram_username,
                     webhook_verify_token = EXCLUDED.webhook_verify_token,
                     updated_at = EXCLUDED.updated_at
                 RETURNING *
@@ -246,8 +271,52 @@ def save_meta_connection(
                 (
                     user_id,
                     page_id,
+                    page_name,
                     access_token,
                     instagram_business_account_id,
+                    instagram_username,
+                    webhook_verify_token,
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+            row = cursor.fetchone()
+    return dict(row)
+
+
+def save_meta_oauth_authorization(
+    user_id: int,
+    user_access_token: str,
+    token_expires_in: Optional[int] = None,
+    webhook_verify_token: Optional[str] = None,
+) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_settings (
+                    user_id,
+                    meta_user_access_token,
+                    meta_user_token_expires_at,
+                    webhook_verify_token,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    meta_user_access_token = EXCLUDED.meta_user_access_token,
+                    meta_user_token_expires_at = EXCLUDED.meta_user_token_expires_at,
+                    webhook_verify_token = COALESCE(
+                        integration_settings.webhook_verify_token,
+                        EXCLUDED.webhook_verify_token
+                    ),
+                    updated_at = EXCLUDED.updated_at
+                RETURNING *
+                """,
+                (
+                    user_id,
+                    user_access_token,
+                    _expires_at(token_expires_in),
                     webhook_verify_token,
                     utc_now(),
                     utc_now(),
