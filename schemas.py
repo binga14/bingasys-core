@@ -56,6 +56,8 @@ class ShopifyConnectionOut(BaseModel):
     connected: bool = False
     store_domain: Optional[str] = None
     access_token_last4: Optional[str] = None
+    catalog_synced_at: Optional[str] = None
+    catalog_sync_status: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

@@ -227,8 +227,17 @@ def extract_messenger_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
 
             image_urls = _extract_image_attachment_urls(message)
+            attachments = message.get("attachments") or []
+            if isinstance(attachments, dict):
+                attachments = [attachments]
+            attachment_count = len(attachments)
+            attachment_types = [
+                str(attachment.get("type") or "")
+                for attachment in attachments
+                if isinstance(attachment, dict)
+            ]
             text_value = text.strip() if isinstance(text, str) else ""
-            if not text_value and not image_urls:
+            if not text_value and not image_urls and not attachment_count:
                 continue
 
             messages.append(
@@ -239,6 +248,8 @@ def extract_messenger_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "message_id": message_id,
                     "text": text_value,
                     "image_urls": image_urls,
+                    "attachment_count": attachment_count,
+                    "attachment_types": attachment_types,
                 }
             )
 
@@ -261,14 +272,35 @@ def extract_messenger_text_messages(payload: dict[str, Any]) -> list[dict[str, s
 
 def _extract_image_attachment_urls(message: dict[str, Any]) -> list[str]:
     urls: list[str] = []
-    for attachment in message.get("attachments") or []:
-        if attachment.get("type") != "image":
+    attachments = message.get("attachments") or []
+    if isinstance(attachments, dict):
+        attachments = [attachments]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
             continue
         payload = attachment.get("payload") or {}
+        attachment_type = str(attachment.get("type") or "").lower()
         url = payload.get("url")
-        if isinstance(url, str) and url.strip():
+        if (
+            isinstance(url, str)
+            and url.strip()
+            and (
+                attachment_type == "image"
+                or _looks_like_meta_image_url(url)
+            )
+        ):
             urls.append(url.strip())
     return urls
+
+
+def _looks_like_meta_image_url(url: str) -> bool:
+    lowered = url.lower()
+    return bool(
+        "fbcdn" in lowered
+        or "cdn.fbsbx" in lowered
+        or "lookaside.fbsbx" in lowered
+        or lowered.split("?", 1)[0].endswith((".jpg", ".jpeg", ".png", ".webp"))
+    )
 
 
 async def send_messenger_text_reply(
@@ -291,6 +323,45 @@ async def send_messenger_text_reply(
     if response.status_code >= 400:
         raise MetaSendMessageError(_format_meta_error(response))
     return response.json()
+
+
+async def fetch_message_image_attachment_urls(
+    message_id: str,
+    page_access_token: str,
+) -> list[str]:
+    if not message_id:
+        return []
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            _graph_url(f"{message_id}/attachments"),
+            params={"access_token": page_access_token},
+        )
+    if response.status_code >= 400:
+        raise MetaWebhookError(_format_meta_error(response))
+
+    urls: list[str] = []
+    for attachment in response.json().get("data") or []:
+        if not isinstance(attachment, dict):
+            continue
+        for url in _attachment_urls_from_graph_attachment(attachment):
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _attachment_urls_from_graph_attachment(attachment: dict[str, Any]) -> list[str]:
+    urls = []
+    for key in ("file_url", "url"):
+        value = attachment.get(key)
+        if isinstance(value, str) and _looks_like_meta_image_url(value):
+            urls.append(value)
+    image_data = attachment.get("image_data")
+    if isinstance(image_data, dict):
+        for key in ("url", "preview_url", "image_url"):
+            value = image_data.get(key)
+            if isinstance(value, str) and _looks_like_meta_image_url(value):
+                urls.append(value)
+    return urls
 
 
 def _messenger_safe_text(text: str) -> str:

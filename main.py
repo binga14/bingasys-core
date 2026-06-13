@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -58,6 +59,12 @@ from services.messaging_service import (
     get_recent_meta_webhook_results,
     handle_meta_message_webhook,
 )
+from services.shopify_catalog_sync import (
+    start_daily_catalog_sync_scheduler,
+    stop_daily_catalog_sync_scheduler,
+    sync_shopify_catalog_for_integration,
+)
+from services.shopify_webhook_service import handle_shopify_webhook
 from schemas import (
     AuthOut,
     ForgotPasswordIn,
@@ -77,9 +84,11 @@ from schemas import (
     UserOut,
 )
 from services.shopify_service import (
+    ShopifyAPIError,
     ShopifyOAuthError,
     build_authorization_url,
     decode_oauth_state,
+    ensure_webhook_subscriptions,
     exchange_code_for_access_token,
     normalize_shop_domain,
     verify_callback_hmac,
@@ -87,6 +96,7 @@ from services.shopify_service import (
 
 app = FastAPI(title=settings.app_name)
 security = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,14 +108,16 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     init_db()
+    start_daily_catalog_sync_scheduler()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     # Reply to any buyer messages still waiting in the debounce buffer so they
     # are not dropped when the server stops.
+    await stop_daily_catalog_sync_scheduler()
     await flush_pending_messages_now()
 
 
@@ -246,7 +258,7 @@ async def complete_shopify_oauth(request: Request) -> RedirectResponse:
             raise ShopifyOAuthError("Shopify did not return an authorization code")
 
         token_response = await exchange_code_for_access_token(shop_domain, code)
-        save_shopify_connection(
+        saved_row = save_shopify_connection(
             user_id=int(state_payload["user_id"]),
             store_domain=shop_domain,
             access_token=token_response["access_token"],
@@ -254,6 +266,19 @@ async def complete_shopify_oauth(request: Request) -> RedirectResponse:
             refresh_token=token_response.get("refresh_token"),
             refresh_token_expires_in=token_response.get("refresh_token_expires_in"),
         )
+        try:
+            await ensure_webhook_subscriptions(
+                store_domain=shop_domain,
+                access_token=token_response["access_token"],
+                callback_url=f"{settings.backend_url.rstrip('/')}/shopify/webhooks",
+                topics=settings.shopify_webhook_topics,
+            )
+        except ShopifyAPIError as exc:
+            logger.warning("Shopify webhook subscription failed shop=%s reason=%s", shop_domain, exc)
+        try:
+            await sync_shopify_catalog_for_integration(saved_row, force_refresh=True)
+        except Exception as exc:  # noqa: BLE001 - connection should survive catalog retry failures
+            logger.warning("Initial Shopify catalog sync failed shop=%s reason=%s", shop_domain, exc)
     except (KeyError, TypeError, ValueError, ShopifyOAuthError) as exc:
         return RedirectResponse(_frontend_redirect({"shopify_error": str(exc)}))
 
@@ -266,6 +291,19 @@ def read_shopify_connection(
 ) -> dict[str, Any]:
     row = get_integration_settings(current_user["id"])
     return _shopify_response(row)
+
+
+@app.post("/api/integrations/shopify/catalog/sync")
+async def sync_shopify_catalog(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    row = get_integration_settings(current_user["id"])
+    if not row or not has_value(row.get("shopify_store_domain")):
+        raise HTTPException(status_code=400, detail="Connect Shopify before syncing the catalog")
+    try:
+        return await sync_shopify_catalog_for_integration(row, force_refresh=True)
+    except (ShopifyAPIError, ShopifyOAuthError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.put("/api/integrations/meta", response_model=MetaConnectionOut)
@@ -463,6 +501,20 @@ async def receive_meta_webhook(request: Request) -> dict[str, Any]:
     return await handle_meta_message_webhook(payload)
 
 
+@app.post("/shopify/webhooks")
+async def receive_shopify_webhook(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    result = await handle_shopify_webhook(
+        body=body,
+        hmac_header=request.headers.get("x-shopify-hmac-sha256"),
+        topic=request.headers.get("x-shopify-topic"),
+        shop_domain=request.headers.get("x-shopify-shop-domain"),
+    )
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("reason", "Webhook failed"))
+    return result
+
+
 def _auth_response(user: dict[str, Any]) -> dict[str, Any]:
     return {
         "access_token": create_access_token(user),
@@ -492,6 +544,8 @@ def _shopify_response(row: Optional[dict[str, Any]]) -> dict[str, Any]:
         "connected": has_value(store_domain),
         "store_domain": store_domain,
         "access_token_last4": _secret_last4(access_token),
+        "catalog_synced_at": row.get("shopify_catalog_synced_at") if row else None,
+        "catalog_sync_status": row.get("shopify_catalog_sync_status") if row else None,
         "created_at": to_iso(row.get("created_at")) if row else None,
         "updated_at": to_iso(row.get("updated_at")) if row else None,
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Optional
 
 import psycopg2
@@ -13,6 +14,8 @@ from models import (
     USERS_TABLE,
     utc_now,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection() -> psycopg2.extensions.connection:
@@ -31,12 +34,206 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS shopify_access_token_expires_at TEXT,
                 ADD COLUMN IF NOT EXISTS shopify_refresh_token TEXT,
                 ADD COLUMN IF NOT EXISTS shopify_refresh_token_expires_at TEXT,
+                ADD COLUMN IF NOT EXISTS shopify_catalog_synced_at TEXT,
+                ADD COLUMN IF NOT EXISTS shopify_catalog_sync_status TEXT,
                 ADD COLUMN IF NOT EXISTS meta_page_name TEXT,
                 ADD COLUMN IF NOT EXISTS meta_user_access_token TEXT,
                 ADD COLUMN IF NOT EXISTS meta_user_token_expires_at TEXT,
                 ADD COLUMN IF NOT EXISTS instagram_username TEXT
                 """
             )
+            _init_catalog_tables(cursor)
+
+
+def _init_catalog_tables(cursor: psycopg2.extensions.cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shopify_products (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            shop_domain TEXT NOT NULL,
+            shopify_product_id TEXT NOT NULL,
+            admin_graphql_api_id TEXT,
+            title TEXT NOT NULL,
+            handle TEXT,
+            status TEXT,
+            vendor TEXT,
+            product_type TEXT,
+            tags TEXT,
+            raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ,
+            UNIQUE (user_id, shopify_product_id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS shopify_products_user_title_idx
+        ON shopify_products (user_id, title)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shopify_product_variants (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            shopify_product_id TEXT NOT NULL,
+            shopify_variant_id TEXT NOT NULL,
+            admin_graphql_api_id TEXT,
+            title TEXT,
+            sku TEXT,
+            price NUMERIC,
+            inventory_item_id TEXT,
+            inventory_quantity INTEGER,
+            inventory_management TEXT,
+            inventory_policy TEXT,
+            raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ,
+            UNIQUE (user_id, shopify_variant_id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS shopify_product_variants_product_idx
+        ON shopify_product_variants (user_id, shopify_product_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS shopify_product_variants_inventory_item_idx
+        ON shopify_product_variants (user_id, inventory_item_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shopify_product_images (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            shopify_product_id TEXT NOT NULL,
+            shopify_image_id TEXT,
+            admin_graphql_api_id TEXT,
+            media_id TEXT,
+            image_url TEXT NOT NULL,
+            position INTEGER,
+            alt TEXT,
+            variant_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+            raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ,
+            UNIQUE (user_id, shopify_product_id, image_url)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS shopify_product_images_product_idx
+        ON shopify_product_images (user_id, shopify_product_id)
+        """
+    )
+    _init_product_image_embeddings_table(cursor)
+
+
+def _init_product_image_embeddings_table(cursor: psycopg2.extensions.cursor) -> None:
+    cursor.execute("SAVEPOINT pgvector_setup")
+    try:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS product_image_embeddings (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                shopify_product_id TEXT NOT NULL,
+                shopify_variant_id TEXT,
+                shopify_image_id TEXT,
+                image_url TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                embedding VECTOR({settings.gemini_embedding_dimensions}),
+                embedding_values JSONB NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            f"""
+            ALTER TABLE product_image_embeddings
+            ADD COLUMN IF NOT EXISTS embedding VECTOR({settings.gemini_embedding_dimensions})
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE product_image_embeddings
+            SET embedding = embedding_values::text::vector
+            WHERE embedding IS NULL
+              AND embedding_dimension = %s
+            """,
+            (settings.gemini_embedding_dimensions,),
+        )
+        cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS product_image_embeddings_unique_idx
+            ON product_image_embeddings (
+                user_id,
+                shopify_product_id,
+                (COALESCE(shopify_variant_id, '')),
+                image_url,
+                embedding_model,
+                embedding_dimension
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS product_image_embeddings_vector_idx
+            ON product_image_embeddings
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100)
+            """
+        )
+        cursor.execute("RELEASE SAVEPOINT pgvector_setup")
+    except psycopg2.Error as exc:
+        logger.warning(
+            "pgvector is not available; product image embeddings will use JSONB fallback: %s",
+            exc,
+        )
+        cursor.execute("ROLLBACK TO SAVEPOINT pgvector_setup")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_image_embeddings (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                shopify_product_id TEXT NOT NULL,
+                shopify_variant_id TEXT,
+                shopify_image_id TEXT,
+                image_url TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                embedding_values JSONB NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS product_image_embeddings_unique_idx
+            ON product_image_embeddings (
+                user_id,
+                shopify_product_id,
+                (COALESCE(shopify_variant_id, '')),
+                image_url,
+                embedding_model,
+                embedding_dimension
+            )
+            """
+        )
+        cursor.execute("RELEASE SAVEPOINT pgvector_setup")
 
 
 def create_user(email: str, password_hash: str) -> Optional[dict[str, Any]]:
@@ -186,6 +383,38 @@ def find_integration_by_meta_page_id(page_id: str) -> Optional[dict[str, Any]]:
     return dict(row) if row else None
 
 
+def find_integration_by_shop_domain(shop_domain: str) -> Optional[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_settings
+                WHERE shopify_store_domain = %s
+                """,
+                (shop_domain,),
+            )
+            row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def list_shopify_integrations() -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_settings
+                WHERE shopify_store_domain IS NOT NULL
+                  AND shopify_access_token IS NOT NULL
+                  AND TRIM(shopify_store_domain) <> ''
+                  AND TRIM(shopify_access_token) <> ''
+                """
+            )
+            rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
 def save_shopify_connection(
     user_id: int,
     store_domain: str,
@@ -231,6 +460,25 @@ def save_shopify_connection(
             )
             row = cursor.fetchone()
     return dict(row)
+
+
+def save_shopify_catalog_sync_status(
+    user_id: int,
+    status: str,
+    synced_at: Optional[str] = None,
+) -> None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_settings
+                SET shopify_catalog_sync_status = %s,
+                    shopify_catalog_synced_at = COALESCE(%s, shopify_catalog_synced_at),
+                    updated_at = %s
+                WHERE user_id = %s
+                """,
+                (status, synced_at, utc_now(), user_id),
+            )
 
 
 def save_meta_connection(

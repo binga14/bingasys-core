@@ -43,13 +43,23 @@ async def identify_product_from_image(
 
     image_bytes, mime_type = await _download_image(image_url)
     prompt = (
-        "Identify the ecommerce product in this image for Shopify catalog matching. "
-        "Return only compact JSON with these keys: product_type, colors, "
-        "visual_features, readable_text, search_query, confidence. "
+        "You are helping a buyer find a product from a store's catalog using a photo "
+        "they sent. Look at the image and return only compact JSON with these keys: "
+        "description, product_type, brand, colors, size, visual_features, readable_text, "
+        "search_query, confidence, needs_more_info, follow_up_question. "
+        "description: one short natural sentence naming the product and its key visible "
+        "attributes, for example 'a blue Nike Air Max running shoe'. "
+        "search_query: a short keyword phrase for catalog search using only attributes "
+        "you can actually see. "
         "confidence must be one of high, medium, or low. "
-        "The search_query should be a short phrase using only visible attributes. "
-        "Do not invent a brand or exact Shopify product title unless text in the image "
-        "clearly shows it."
+        "Set needs_more_info to true only when the photo is too ambiguous to search the "
+        "catalog confidently (for example the product type is unclear, or many very "
+        "different products would match). When needs_more_info is true, set "
+        "follow_up_question to one short, friendly question asking the buyer for the "
+        "single most useful missing detail (such as brand, color, size, or model). "
+        "Otherwise set needs_more_info to false and follow_up_question to an empty string. "
+        "Do not invent a brand or exact catalog title unless text in the image clearly "
+        "shows it."
     )
     if buyer_text.strip():
         prompt += f" Buyer message: {buyer_text.strip()}"
@@ -71,7 +81,7 @@ async def identify_product_from_image(
         ],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 256,
+            "maxOutputTokens": 384,
             "responseMimeType": "application/json",
         },
     }
@@ -96,7 +106,9 @@ async def identify_product_from_image(
     data = response.json()
     text = _extract_text(data)
     parsed = _parse_json_object(text)
-    search_query = str(parsed.get("search_query") or text).strip()
+    search_query = str(
+        parsed.get("search_query") or parsed.get("description") or text
+    ).strip()
     return {
         "text": search_query,
         "confidence": str(parsed.get("confidence") or "").lower(),
